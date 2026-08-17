@@ -38,6 +38,24 @@
 # The API auto-migrates Postgres on boot. Pin OPENSHIP_VERSION for reproducible
 # upgrades; it defaults to a release tag rather than `latest` so a redeploy does
 # not silently move versions.
+#
+# CREATING THE FIRST ADMIN. You cannot do this in the browser, and the reason is
+# not a misconfiguration: the invite-only guard admits a Better Auth sign-up only
+# when no user exists AND the peer is loopback (apps/api/src/modules/auth/
+# auth.routes.ts) — deliberately, to close the remote first-admin race. Behind a
+# proxy the API's peer is the dashboard container, never loopback, so the browser
+# gets 403 SIGNUP_DISABLED no matter what. Bootstrap from inside the api
+# container instead, which is what the CLI wizard does over its own loopback:
+#
+#   docker exec <api-container> bun -e "fetch('http://127.0.0.1:4000/api/system/\
+#   bootstrap-admin',{method:'POST',headers:{'Content-Type':'application/json',\
+#   'X-Internal-Token':process.env.INTERNAL_TOKEN},body:JSON.stringify({\
+#   email:'you@example.com',password:'<strong-password>',name:'Admin'})})\
+#   .then(async r=>console.log(r.status,await r.text()))"
+#
+# It is internal-token gated and one-shot — it 409s once a real admin exists.
+# Everyone after joins by invite (Settings → Team). Locked out later? The same
+# token fronts POST /api/system/reset-admin-password.
 # ──────────────────────────────────────────────────────────
 
 services:
