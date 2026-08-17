@@ -1,0 +1,147 @@
+# ──────────────────────────────────────────────────────────
+# Openship — Docker Compose (COOLIFY)
+#
+# A third stack, alongside the two that already live here:
+#   • ../docker-compose.yml        SaaS / from-source control plane (builds)
+#   • ./docker-compose.yml         self-hosted, pull-based, OWNS :80/:443
+#   • ./docker-compose.coolify.yml THIS FILE — pull-based, proxy-fronted
+#
+# WHY A SEPARATE FILE. Neither existing stack deploys on Coolify as-is:
+#
+#   1. Both do `env_file: .env`, and `.env` is gitignored. Coolify deploys from
+#      a fresh `git clone`, where that file does not exist, so compose aborts
+#      before a single container starts. Here every value comes from the
+#      resource's own environment instead — nothing is read off disk.
+#   2. ./docker-compose.yml ships `edge` (OpenResty, `network_mode: host`) which
+#      binds host :80/:443. Coolify's own proxy already owns those ports, so the
+#      edge cannot bind and the stack never converges. The edge is DROPPED here
+#      and Coolify's proxy does the routing + TLS instead.
+#   3. Both publish ports onto the host. Coolify routes over its own network to
+#      the container port, so publishing is unnecessary here (and would clash on
+#      a box that hosts other resources). Everything below is `expose` only.
+#
+# WHAT THIS COSTS. No edge means this control plane cannot put a deployed app on
+# a public domain *on this box* — :80/:443 belong to Coolify. The dashboard, API,
+# auth, projects and Postgres/Redis all work, and it can drive OTHER servers over
+# SSH. To have Openship route domains itself, give it a box Coolify isn't on.
+#
+# The Docker socket is deliberately NOT mounted: it would make this container
+# host-root on the same daemon Coolify manages. Uncomment the `volumes` block on
+# `api` only if you accept that, and only for deploys onto this same box.
+#
+# ROUTING. `SERVICE_FQDN_DASHBOARD_3001` asks Coolify to mint a domain for the
+# dashboard and route it to :3001. Only the dashboard is public — the browser
+# never talks to the API directly; it goes through the dashboard's same-origin
+# /api/proxy (apps/dashboard/src/app/api/proxy/[...path]/route.ts), so the API
+# stays on the internal network with no domain of its own.
+#
+# The API auto-migrates Postgres on boot. Pin OPENSHIP_VERSION for reproducible
+# upgrades; it defaults to a release tag rather than `latest` so a redeploy does
+# not silently move versions.
+# ──────────────────────────────────────────────────────────
+
+services:
+  # ─── Database (storage, private) ──────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # Data dir in a SUBDIR of the volume so initdb never runs against a bare
+      # mount root — that fails with "Operation not permitted" on some host
+      # filesystems (docs/installation.md, #350).
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: ${POSTGRES_USER:-openship}
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
+      POSTGRES_DB: ${POSTGRES_DB:-openship}
+    expose:
+      - "5432"
+    volumes:
+      - openship-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openship} -d ${POSTGRES_DB:-openship}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # ─── Cache / Queue / Rate-limit (private) ─────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    expose:
+      - "6379"
+    volumes:
+      - openship-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # ─── API (control plane, private) ─────────────────────
+  api:
+    image: ghcr.io/oblien/openship-api:${OPENSHIP_VERSION:-0.6.6}
+    restart: unless-stopped
+    expose:
+      - "4000"
+    # Uncomment to let this control plane deploy containers onto the box Coolify
+    # runs on. It makes the API host-root through the socket — see header.
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      # Self-hosted posture: no billing, no multi-tenancy. "docker" is the
+      # server-install mode — NOT "desktop", which would relax the zero-auth and
+      # internal-token gates on a networked box (apps/api/src/config/env.ts).
+      CLOUD_MODE: "false"
+      DEPLOY_MODE: docker
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openship}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-openship}
+      REDIS_URL: redis://redis:6379
+      # Redis is a real service here, so force the Redis-backed job runner /
+      # cache / rate-limiter rather than silently falling back to in-memory.
+      OPENSHIP_REQUIRE_REDIS: "true"
+      # Both are boot-critical: env.ts throws on a placeholder BETTER_AUTH_SECRET
+      # and refuses to boot at all without INTERNAL_TOKEN when DEPLOY_MODE is not
+      # "desktop" (unset INTERNAL_TOKEN would silently open the internal routes).
+      BETTER_AUTH_SECRET: ${SERVICE_PASSWORD_64_BETTERAUTH}
+      INTERNAL_TOKEN: ${SERVICE_PASSWORD_64_INTERNALTOKEN}
+      # The exact origin the browser uses. Without it the dashboard loads but
+      # login is rejected with 403 ORIGIN_REJECTED.
+      OPENSHIP_PUBLIC_URL: ${SERVICE_FQDN_DASHBOARD}
+      # Behind Coolify's proxy, key rate limits to the real client IP — else
+      # every user shares the proxy's single bucket and can lock each other out.
+      TRUST_PROXY: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  # ─── Dashboard (app UI, public) ───────────────────────
+  dashboard:
+    image: ghcr.io/oblien/openship-dashboard:${OPENSHIP_VERSION:-0.6.6}
+    restart: unless-stopped
+    expose:
+      - "3001"
+    environment:
+      # Mints the domain and points Coolify's proxy at :3001 (see ROUTING above).
+      SERVICE_FQDN_DASHBOARD_3001: ""
+      NODE_ENV: production
+      PORT: "3001"
+      INTERNAL_API_URL: http://api:4000
+      OPENSHIP_PUBLIC_URL: ${SERVICE_FQDN_DASHBOARD}
+      TRUST_PROXY: "true"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  openship-postgres:
+  openship-redis:
